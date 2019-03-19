@@ -43,6 +43,7 @@
 #include "src/core/lib/gprpp/memory.h"
 #include "src/core/lib/http/parser.h"
 #include "src/core/lib/iomgr/executor.h"
+#include "src/core/lib/iomgr/iomgr.h"
 #include "src/core/lib/iomgr/timer.h"
 #include "src/core/lib/profiling/timers.h"
 #include "src/core/lib/slice/slice_internal.h"
@@ -823,10 +824,10 @@ static const char* write_state_name(grpc_chttp2_write_state st) {
 
 static void set_write_state(grpc_chttp2_transport* t,
                             grpc_chttp2_write_state st, const char* reason) {
-  GRPC_CHTTP2_IF_TRACING(gpr_log(GPR_INFO, "W:%p %s state %s -> %s [%s]", t,
-                                 t->is_client ? "CLIENT" : "SERVER",
-                                 write_state_name(t->write_state),
-                                 write_state_name(st), reason));
+  GRPC_CHTTP2_IF_TRACING(
+      gpr_log(GPR_INFO, "W:%p %s [%s] state %s -> %s [%s]", t,
+              t->is_client ? "CLIENT" : "SERVER", t->peer_string,
+              write_state_name(t->write_state), write_state_name(st), reason));
   t->write_state = st;
   /* If the state is being reset back to idle, it means a write was just
    * finished. Make sure all the run_after_write closures are scheduled.
@@ -963,24 +964,28 @@ void grpc_chttp2_mark_stream_writable(grpc_chttp2_transport* t,
 static grpc_closure_scheduler* write_scheduler(grpc_chttp2_transport* t,
                                                bool early_results_scheduled,
                                                bool partial_write) {
+  // If we're already in a background poller, don't offload this to an executor
+  if (grpc_iomgr_is_any_background_poller_thread()) {
+    return grpc_schedule_on_exec_ctx;
+  }
   /* if it's not the first write in a batch, always offload to the executor:
      we'll probably end up queuing against the kernel anyway, so we'll likely
      get better latency overall if we switch writing work elsewhere and continue
      with application work above */
   if (!t->is_first_write_in_batch) {
-    return grpc_executor_scheduler(GRPC_EXECUTOR_SHORT);
+    return grpc_core::Executor::Scheduler(grpc_core::ExecutorJobType::SHORT);
   }
   /* equivalently, if it's a partial write, we *know* we're going to be taking a
      thread jump to write it because of the above, may as well do so
      immediately */
   if (partial_write) {
-    return grpc_executor_scheduler(GRPC_EXECUTOR_SHORT);
+    return grpc_core::Executor::Scheduler(grpc_core::ExecutorJobType::SHORT);
   }
   switch (t->opt_target) {
     case GRPC_CHTTP2_OPTIMIZE_FOR_THROUGHPUT:
       /* executor gives us the largest probability of being able to batch a
        * write with others on this transport */
-      return grpc_executor_scheduler(GRPC_EXECUTOR_SHORT);
+      return grpc_core::Executor::Scheduler(grpc_core::ExecutorJobType::SHORT);
     case GRPC_CHTTP2_OPTIMIZE_FOR_LATENCY:
       return grpc_schedule_on_exec_ctx;
   }
@@ -1057,12 +1062,15 @@ static void write_action_end_locked(void* tp, grpc_error* error) {
   GPR_TIMER_SCOPE("terminate_writing_with_lock", 0);
   grpc_chttp2_transport* t = static_cast<grpc_chttp2_transport*>(tp);
 
+  bool closed = false;
   if (error != GRPC_ERROR_NONE) {
     close_transport_locked(t, GRPC_ERROR_REF(error));
+    closed = true;
   }
 
   if (t->sent_goaway_state == GRPC_CHTTP2_GOAWAY_SEND_SCHEDULED) {
     t->sent_goaway_state = GRPC_CHTTP2_GOAWAY_SENT;
+    closed = true;
     if (grpc_chttp2_stream_map_size(&t->stream_map) == 0) {
       close_transport_locked(
           t, GRPC_ERROR_CREATE_FROM_STATIC_STRING("goaway sent"));
@@ -1081,6 +1089,14 @@ static void write_action_end_locked(void* tp, grpc_error* error) {
       set_write_state(t, GRPC_CHTTP2_WRITE_STATE_WRITING, "continue writing");
       t->is_first_write_in_batch = false;
       GRPC_CHTTP2_REF_TRANSPORT(t, "writing");
+      // If the transport is closed, we will retry writing on the endpoint
+      // and next write may contain part of the currently serialized frames.
+      // So, we should only call the run_after_write callbacks when the next
+      // write finishes, or the callbacks will be invoked when the stream is
+      // closed.
+      if (!closed) {
+        GRPC_CLOSURE_LIST_SCHED(&t->run_after_write);
+      }
       GRPC_CLOSURE_RUN(
           GRPC_CLOSURE_INIT(&t->write_action_begin_locked,
                             write_action_begin_locked, t,
@@ -1113,19 +1129,22 @@ static void queue_setting_update(grpc_chttp2_transport* t,
 
 void grpc_chttp2_add_incoming_goaway(grpc_chttp2_transport* t,
                                      uint32_t goaway_error,
-                                     grpc_slice goaway_text) {
-  // GRPC_CHTTP2_IF_TRACING(
-  //     gpr_log(GPR_INFO, "got goaway [%d]: %s", goaway_error, msg));
-
+                                     const grpc_slice& goaway_text) {
   // Discard the error from a previous goaway frame (if any)
   if (t->goaway_error != GRPC_ERROR_NONE) {
     GRPC_ERROR_UNREF(t->goaway_error);
   }
   t->goaway_error = grpc_error_set_str(
       grpc_error_set_int(
-          GRPC_ERROR_CREATE_FROM_STATIC_STRING("GOAWAY received"),
-          GRPC_ERROR_INT_HTTP2_ERROR, static_cast<intptr_t>(goaway_error)),
+          grpc_error_set_int(
+              GRPC_ERROR_CREATE_FROM_STATIC_STRING("GOAWAY received"),
+              GRPC_ERROR_INT_HTTP2_ERROR, static_cast<intptr_t>(goaway_error)),
+          GRPC_ERROR_INT_GRPC_STATUS, GRPC_STATUS_UNAVAILABLE),
       GRPC_ERROR_STR_RAW_BYTES, goaway_text);
+
+  /* We want to log this irrespective of whether http tracing is enabled */
+  gpr_log(GPR_INFO, "%s: Got goaway [%d] err=%s", t->peer_string, goaway_error,
+          grpc_error_string(t->goaway_error));
 
   /* When a client receives a GOAWAY with error code ENHANCE_YOUR_CALM and debug
    * data equal to "too_many_pings", it should log the occurrence at a log level
@@ -1769,6 +1788,9 @@ void grpc_chttp2_ack_ping(grpc_chttp2_transport* t, uint64_t id) {
 }
 
 static void send_goaway(grpc_chttp2_transport* t, grpc_error* error) {
+  /* We want to log this irrespective of whether http tracing is enabled */
+  gpr_log(GPR_INFO, "%s: Sending goaway err=%s", t->peer_string,
+          grpc_error_string(error));
   t->sent_goaway_state = GRPC_CHTTP2_GOAWAY_SEND_SCHEDULED;
   grpc_http2_error_code http_error;
   grpc_slice slice;
@@ -2454,7 +2476,6 @@ static grpc_error* try_http_parsing(grpc_chttp2_transport* t) {
   size_t i = 0;
   grpc_error* error = GRPC_ERROR_NONE;
   grpc_http_response response;
-  memset(&response, 0, sizeof(response));
 
   grpc_http_parser_init(&parser, GRPC_HTTP_RESPONSE, &response);
 
@@ -2549,11 +2570,16 @@ static void read_action_locked(void* tp, grpc_error* error) {
   } else if (t->closed_with_error == GRPC_ERROR_NONE) {
     keep_reading = true;
     GRPC_CHTTP2_REF_TRANSPORT(t, "keep_reading");
+    /* Since we have read a byte, reset the keepalive timer */
+    if (t->keepalive_state == GRPC_CHTTP2_KEEPALIVE_STATE_WAITING) {
+      grpc_timer_cancel(&t->keepalive_ping_timer);
+    }
   }
   grpc_slice_buffer_reset_and_unref_internal(&t->read_buffer);
 
   if (keep_reading) {
-    grpc_endpoint_read(t->ep, &t->read_buffer, &t->read_action_locked);
+    const bool urgent = t->goaway_error != GRPC_ERROR_NONE;
+    grpc_endpoint_read(t->ep, &t->read_buffer, &t->read_action_locked, urgent);
     grpc_chttp2_act_on_flowctl_action(t->flow_control->MakeAction(), t,
                                       nullptr);
     GRPC_CHTTP2_UNREF_TRANSPORT(t, "keep_reading");
@@ -2718,6 +2744,9 @@ static void start_keepalive_ping_locked(void* arg, grpc_error* error) {
   if (t->channelz_socket != nullptr) {
     t->channelz_socket->RecordKeepaliveSent();
   }
+  if (grpc_http_trace.enabled()) {
+    gpr_log(GPR_INFO, "%s: Start keepalive ping", t->peer_string);
+  }
   GRPC_CHTTP2_REF_TRANSPORT(t, "keepalive watchdog");
   grpc_timer_init(&t->keepalive_watchdog_timer,
                   grpc_core::ExecCtx::Get()->Now() + t->keepalive_timeout,
@@ -2728,6 +2757,9 @@ static void finish_keepalive_ping_locked(void* arg, grpc_error* error) {
   grpc_chttp2_transport* t = static_cast<grpc_chttp2_transport*>(arg);
   if (t->keepalive_state == GRPC_CHTTP2_KEEPALIVE_STATE_PINGING) {
     if (error == GRPC_ERROR_NONE) {
+      if (grpc_http_trace.enabled()) {
+        gpr_log(GPR_INFO, "%s: Finish keepalive ping", t->peer_string);
+      }
       t->keepalive_state = GRPC_CHTTP2_KEEPALIVE_STATE_WAITING;
       grpc_timer_cancel(&t->keepalive_watchdog_timer);
       GRPC_CHTTP2_REF_TRANSPORT(t, "init keepalive ping");
@@ -2743,6 +2775,8 @@ static void keepalive_watchdog_fired_locked(void* arg, grpc_error* error) {
   grpc_chttp2_transport* t = static_cast<grpc_chttp2_transport*>(arg);
   if (t->keepalive_state == GRPC_CHTTP2_KEEPALIVE_STATE_PINGING) {
     if (error == GRPC_ERROR_NONE) {
+      gpr_log(GPR_ERROR, "%s: Keepalive watchdog fired. Closing transport.",
+              t->peer_string);
       t->keepalive_state = GRPC_CHTTP2_KEEPALIVE_STATE_DYING;
       close_transport_locked(
           t, grpc_error_set_int(GRPC_ERROR_CREATE_FROM_STATIC_STRING(
@@ -2964,7 +2998,7 @@ void Chttp2IncomingByteStream::PublishError(grpc_error* error) {
   grpc_chttp2_cancel_stream(transport_, stream_, GRPC_ERROR_REF(error));
 }
 
-grpc_error* Chttp2IncomingByteStream::Push(grpc_slice slice,
+grpc_error* Chttp2IncomingByteStream::Push(const grpc_slice& slice,
                                            grpc_slice* slice_out) {
   if (remaining_bytes_ < GRPC_SLICE_LENGTH(slice)) {
     grpc_error* error =

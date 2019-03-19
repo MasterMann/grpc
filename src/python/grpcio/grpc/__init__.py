@@ -14,6 +14,7 @@
 """gRPC's Python API."""
 
 import abc
+import contextlib
 import enum
 import logging
 import sys
@@ -22,6 +23,11 @@ import six
 from grpc._cython import cygrpc as _cygrpc
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+try:
+    from grpc._grpcio_metadata import __version__
+except ImportError:
+    __version__ = "dev0"
 
 ############################## Future Interface  ###############################
 
@@ -1772,6 +1778,14 @@ def server(thread_pool,
                                  if interceptors is None else interceptors, ()
                                  if options is None else options,
                                  maximum_concurrent_rpcs)
+
+
+@contextlib.contextmanager
+def _create_servicer_context(rpc_event, state, request_deserializer):
+    from grpc import _server  # pylint: disable=cyclic-import
+    context = _server._Context(rpc_event, state, request_deserializer)
+    yield context
+    context._finalize_state()  # pylint: disable=protected-access
 
 
 ###################################  __all__  #################################

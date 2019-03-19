@@ -32,6 +32,7 @@
 #include <grpcpp/impl/call.h>
 #include <grpcpp/support/time.h>
 
+#include "src/core/lib/gprpp/ref_counted.h"
 #include "src/core/lib/surface/call.h"
 
 namespace grpc {
@@ -116,13 +117,7 @@ class ServerContext::CompletionOp final : public internal::CallOpSetInterface {
     done_intercepting_ = true;
     if (!has_tag_) {
       /* We don't have a tag to return. */
-      std::unique_lock<std::mutex> lock(mu_);
-      if (--refs_ == 0) {
-        lock.unlock();
-        grpc_call* call = call_.call();
-        delete this;
-        grpc_call_unref(call);
-      }
+      Unref();
       return;
     }
     /* Start a dummy op so that we can return the tag */
@@ -138,12 +133,12 @@ class ServerContext::CompletionOp final : public internal::CallOpSetInterface {
   }
 
   internal::Call call_;
-  internal::ServerReactor* reactor_;
+  internal::ServerReactor* const reactor_;
   bool has_tag_;
   void* tag_;
   void* core_cq_tag_;
+  grpc_core::RefCount refs_;
   std::mutex mu_;
-  int refs_;
   bool finalized_;
   int cancelled_;  // This is an int (not bool) because it is passed to core
   bool done_intercepting_;
@@ -151,9 +146,7 @@ class ServerContext::CompletionOp final : public internal::CallOpSetInterface {
 };
 
 void ServerContext::CompletionOp::Unref() {
-  std::unique_lock<std::mutex> lock(mu_);
-  if (--refs_ == 0) {
-    lock.unlock();
+  if (refs_.Unref()) {
     grpc_call* call = call_.call();
     delete this;
     grpc_call_unref(call);
@@ -183,12 +176,7 @@ bool ServerContext::CompletionOp::FinalizeResult(void** tag, bool* status) {
       *tag = tag_;
       ret = true;
     }
-    if (--refs_ == 0) {
-      lock.unlock();
-      grpc_call* call = call_.call();
-      delete this;
-      grpc_call_unref(call);
-    }
+    Unref();
     return ret;
   }
   finalized_ = true;
@@ -200,12 +188,17 @@ bool ServerContext::CompletionOp::FinalizeResult(void** tag, bool* status) {
     cancelled_ = 1;
   }
 
-  if (cancelled_ && (reactor_ != nullptr)) {
+  // Decide whether to call the cancel callback before releasing the lock
+  bool call_cancel = (cancelled_ != 0);
+
+  // Release the lock since we are going to be calling a callback and
+  // interceptors now
+  lock.unlock();
+
+  if (call_cancel && (reactor_ != nullptr)) {
     reactor_->OnCancel();
   }
-  /* Release the lock since we are going to be running through interceptors now
-   */
-  lock.unlock();
+
   /* Add interception point and run through interceptors */
   interceptor_methods_.AddInterceptionHookPoint(
       experimental::InterceptionHookPoints::POST_RECV_CLOSE);
@@ -215,13 +208,7 @@ bool ServerContext::CompletionOp::FinalizeResult(void** tag, bool* status) {
       *tag = tag_;
       ret = true;
     }
-    lock.lock();
-    if (--refs_ == 0) {
-      lock.unlock();
-      grpc_call* call = call_.call();
-      delete this;
-      grpc_call_unref(call);
-    }
+    Unref();
     return ret;
   }
   /* There are interceptors to be run. Return false for now */
